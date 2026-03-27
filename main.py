@@ -11,7 +11,6 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://cyphers.nexon.com"
 LIST_URL = f"{BASE_URL}/article/update"
 STATE_FILE = "state.json"
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 HEADERS = {
     "User-Agent": (
@@ -68,7 +67,10 @@ def load_state():
         return {"last_url": None}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {"last_url": None}
+            return {"last_url": data.get("last_url")}
     except Exception:
         return {"last_url": None}
 
@@ -93,7 +95,9 @@ def should_skip_line(line: str) -> bool:
         "댓글",
         "공유",
         "닫기",
+        "TOP",
     }
+
     skip_contains = [
         "상세 변경 내용은 원문 확인",
         "이 글을 SNS로 공유하기",
@@ -102,6 +106,13 @@ def should_skip_line(line: str) -> bool:
         "네비게이션",
         "copyright",
         "COPYRIGHT",
+        "All Rights Reserved",
+        "사업자등록번호",
+        "통신판매업 신고번호",
+        "개인정보처리방침",
+        "이용약관",
+        "청소년보호정책",
+        "운영정책",
     ]
 
     if line in skip_exact:
@@ -119,11 +130,13 @@ def extract_topic_urls(html_text):
     urls = re.findall(r"/article/update/topic/\d+", html_text)
     result = []
     seen = set()
+
     for u in urls:
         full = urljoin(BASE_URL, u)
         if full not in seen:
             seen.add(full)
             result.append(full)
+
     return result
 
 
@@ -162,46 +175,44 @@ def is_target_update_title(title: str) -> bool:
     if not title:
         return False
 
-    # 퍼스트 서버는 제외
     if "퍼스트 서버" in title:
         return False
 
-    # 기존 운영 방식 유지
     if "정기점검 업데이트" in title:
         return True
 
-    # 혹시 제목 구조가 바뀌어도 점검+업데이트 글은 잡도록 완화
-    return "업데이트" in title and "점검" in title
+    if "업데이트" in title and "점검" in title:
+        return True
+
+    return False
 
 
 def find_latest_target_post():
     html_text = fetch_html(LIST_URL)
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    # 앵커 기준으로 제목과 링크를 함께 탐색
-    anchors = soup.find_all("a", href=True)
-    candidates = []
-
-    for a in anchors:
-        href = a.get("href", "")
-        if "/article/update/topic/" not in href:
-            continue
-        url = urljoin(BASE_URL, href)
-        title = clean_title(a.get_text(" ", strip=True))
-        if not title:
-            continue
-        candidates.append((title, url))
-
-    for title, url in candidates:
-        if is_target_update_title(title):
-            return url, title
-
-    # 제목 파싱이 실패해도 첫 번째 topic 링크는 fallback
     urls = extract_topic_urls(html_text)
-    if urls:
-        return urls[0], None
 
-    raise RuntimeError("업데이트 글 URL을 찾지 못했습니다.")
+    if not urls:
+        raise RuntimeError("업데이트 목록에서 글 URL을 찾지 못했습니다.")
+
+    # 최신 순으로 여러 개 확인해서 퍼스트 서버 제외
+    for url in urls[:12]:
+        try:
+            soup = BeautifulSoup(fetch_html(url), "html.parser")
+            title = extract_title_from_soup(soup)
+            if is_target_update_title(title):
+                return url, title
+        except Exception as e:
+            print(f"[warn] 글 확인 실패: {url} / {e}")
+
+    # fallback
+    fallback_url = urls[0]
+    try:
+        soup = BeautifulSoup(fetch_html(fallback_url), "html.parser")
+        fallback_title = extract_title_from_soup(soup)
+    except Exception:
+        fallback_title = None
+
+    return fallback_url, fallback_title
 
 
 def pick_article_container(soup):
@@ -242,15 +253,11 @@ def is_section_header(line: str):
     normalized = normalize_line(line)
     compact = re.sub(r"\s+", "", normalized).upper()
 
-    # SYSTEM 계열
     if compact.startswith("SYSTEM"):
         return "system"
-    if "시스템" in normalized and (
-        normalized.startswith("SYSTEM") or normalized == "시스템"
-    ):
+    if "시스템" in normalized and (normalized.startswith("SYSTEM") or normalized == "시스템"):
         return "system"
 
-    # BALANCE 계열
     if compact.startswith("BALANCE"):
         return "balance"
     if "밸런스" in normalized:
@@ -258,14 +265,14 @@ def is_section_header(line: str):
     if "밸런싱" in normalized:
         return "balance"
 
-    # ETC 계열
     if compact.startswith("ETC"):
         return "etc"
-    if "버그 수정" in normalized or normalized == "기타":
+    if normalized == "기타":
+        return "etc"
+    if "버그 수정" in normalized:
         return "etc"
 
     return None
-
 
 
 def split_sections(lines):
@@ -298,17 +305,22 @@ def split_sections(lines):
     return sections
 
 
-
 def cleanup_general_lines(lines):
     result = []
+
     for raw in lines:
         line = normalize_line(raw)
-        line = re.sub(r"^[\-•·▪▫▶▷►]+\s*", "", line)
+        line = re.sub(r"^[\-•·▪▫▶▷►◎※]+\s*", "", line)
+
+        if not line:
+            continue
         if should_skip_line(line):
             continue
         if is_section_header(line):
             continue
+
         result.append(line)
+
     return unique_keep_order(result)
 
 
@@ -317,22 +329,15 @@ def cleanup_balance_detail_lines(lines):
 
     for raw in lines:
         line = normalize_line(raw)
-
-        line = re.sub(r"^[\-•·▪▫▶▷►]+\s*", "", line)
+        line = re.sub(r"^[\-•·▪▫▶▷►◎※]+\s*", "", line)
 
         if not line:
             continue
-
-        # 불필요 문구 제거
         if should_skip_line(line):
             continue
-
-        # 섹션 헤더는 제외
         if is_section_header(line):
             continue
-
-        # 표 설명/빈 장식 제거
-        if line in {"※표 : 가슴 아이템 가격 변경 표", "표 : 가슴 아이템 가격 변경 표"}:
+        if line in {"표 : 가슴 아이템 가격 변경 표", "가슴 아이템 가격 변경 표"}:
             continue
 
         result.append(line)
@@ -340,18 +345,9 @@ def cleanup_balance_detail_lines(lines):
     return dedupe_consecutive(result)
 
 
-
-def is_dev_comment_header(line: str) -> bool:
-    normalized = normalize_line(line)
-    normalized = normalized.strip("[]")
-    return normalized.startswith("개발자 코멘트")
-
-
 def split_dev_comment_inline(line: str):
-    """
-    '개발자 코멘트 : ...' 형태면 헤더/본문 분리
-    """
     line = normalize_line(line).strip("[]")
+
     if not line.startswith("개발자 코멘트"):
         return False, line
 
@@ -361,6 +357,9 @@ def split_dev_comment_inline(line: str):
 
 
 def looks_like_change_line(line: str) -> bool:
+    if not line:
+        return False
+
     if "→" in line:
         return True
 
@@ -376,30 +375,40 @@ def looks_like_change_line(line: str) -> bool:
         "적용",
         "가능",
         "불가",
-        "고정",
+        "지급",
+        "제거",
         "상향",
         "하향",
-        "초",
-        "범위",
-        "속도",
-        "데미지",
         "쿨타임",
-        "재사용",
+        "체력",
+        "대미지",
+        "공격력",
+        "공격속도",
+        "이동속도",
+        "공격 속도",
+        "방어 관통력",
         "선 딜레이",
         "후 딜레이",
+        "지속시간",
+        "범위",
+        "타격",
+        "시야",
+        "코인",
+        "비용",
+        "보호막",
         "경직",
-        "슈퍼아머",
         "무적",
-        "넉백",
-        "피격",
-        "이동속도",
-        "공격속도",
+        "공성",
+        "몬스터",
+        "인간 추가 대미지",
+        "다운된 대상",
+        "기본 스탯",
     ]
 
     if any(k in line for k in keywords):
         return True
 
-    if re.search(r"\d", line) and any(token in line for token in [":", "%", ".", "초"]):
+    if re.search(r"\d", line) and any(token in line for token in [":", "%", ".", "초", "코인"]):
         return True
 
     return False
@@ -408,18 +417,18 @@ def looks_like_change_line(line: str) -> bool:
 def looks_like_character_name(line: str) -> bool:
     if not line:
         return False
-    if len(line) > 18:
-        return False
-    if is_dev_comment_header(line):
+    if len(line) > 24:
         return False
     if looks_like_change_line(line):
         return False
-    if re.search(r"\((?:L|R|E|F|SP|2nd|Shift|Tab|Wheel)", line, re.I):
+    if "개발자 코멘트" in line:
+        return False
+    if re.search(r"\((?:[^)]*(?:L|R|E|F|SP|SL|LR|2nd|Shift|Tab|Wheel)[^)]*)\)", line, re.I):
         return False
     if any(ch in line for ch in [":", "/", "[", "]"]):
         return False
 
-    return bool(re.fullmatch(r"[가-힣A-Za-z0-9\s·ㆍ\-]{1,18}", line))
+    return bool(re.fullmatch(r"[가-힣A-Za-z0-9\s·ㆍ&,\-]{1,24}", line))
 
 
 def looks_like_skill_name(line: str) -> bool:
@@ -427,17 +436,15 @@ def looks_like_skill_name(line: str) -> bool:
         return False
     if len(line) > 40:
         return False
-    if is_dev_comment_header(line):
+    if "개발자 코멘트" in line:
         return False
     if looks_like_change_line(line):
         return False
 
-    # 조작키/2nd 표기가 있으면 거의 확실히 스킬명
-    if re.search(r"\((?:[^)]*(?:L|R|E|F|SP|2nd|Shift|Tab|Wheel)[^)]*)\)", line, re.I):
+    if re.search(r"\((?:[^)]*(?:L|R|E|F|SP|SL|LR|2nd|Shift|Tab|Wheel)[^)]*)\)", line, re.I):
         return True
 
-    # 짧은 제목형 텍스트면 스킬명으로 간주
-    if bool(re.fullmatch(r"[가-힣A-Za-z0-9\s·ㆍ\-/]{1,28}", line)):
+    if bool(re.fullmatch(r"[가-힣A-Za-z0-9\s·ㆍ&,\-/]{1,28}", line)):
         return True
 
     return False
@@ -463,6 +470,7 @@ def ensure_group(groups, character, skill):
 def parse_balance_groups(lines):
     cleaned = cleanup_balance_detail_lines(lines)
     groups = OrderedDict()
+    global_comments = []
 
     current_character = None
     current_skill = None
@@ -473,54 +481,58 @@ def parse_balance_groups(lines):
 
         if is_comment_header:
             current_mode = "comments"
+
             if inline_comment:
-                if not current_character:
-                    current_character = "공통"
-                if not current_skill:
-                    current_skill = "기타"
-                ensure_group(groups, current_character, current_skill)
-                groups[current_character][current_skill]["comments"].append(inline_comment)
+                if current_character and current_skill:
+                    ensure_group(groups, current_character, current_skill)
+                    groups[current_character][current_skill]["comments"].append(inline_comment)
+                else:
+                    global_comments.append(inline_comment)
             continue
 
         nxt = next_nonempty(cleaned, idx + 1)
 
-        # 캐릭터명 판단
         if looks_like_character_name(line):
-            if looks_like_skill_name(nxt) or is_dev_comment_header(nxt) or looks_like_change_line(nxt):
+            if looks_like_skill_name(nxt) or looks_like_change_line(nxt) or "개발자 코멘트" in nxt:
                 current_character = line
                 current_skill = None
                 current_mode = "changes"
+
                 if current_character not in groups:
                     groups[current_character] = OrderedDict()
                 continue
 
-        # 스킬명 판단
         if current_character and looks_like_skill_name(line):
             current_skill = line
             current_mode = "changes"
             ensure_group(groups, current_character, current_skill)
             continue
 
-        # 내용 라인
         if not current_character:
             current_character = "공통"
+
         if not current_skill:
             current_skill = "기타"
 
         ensure_group(groups, current_character, current_skill)
-        groups[current_character][current_skill][current_mode].append(line)
 
-    # 스킬별 중복 제거
+        if current_mode == "comments":
+            groups[current_character][current_skill]["comments"].append(line)
+        else:
+            groups[current_character][current_skill]["changes"].append(line)
+
     for character, skills in groups.items():
         for skill, data in skills.items():
             data["changes"] = unique_keep_order([x for x in data["changes"] if x.strip()])
             data["comments"] = unique_keep_order([x for x in data["comments"] if x.strip()])
 
-    return groups
+    global_comments = unique_keep_order([x for x in global_comments if x.strip()])
+    return groups, global_comments
 
 
 def build_summary_text(lines, max_len=900):
     cleaned = cleanup_general_lines(lines)
+
     if not cleaned:
         return "내용 없음"
 
@@ -535,9 +547,11 @@ def build_summary_text(lines, max_len=900):
             width=44,
         )
         needed = len(bullet) + 1
+
         if current_len + needed > max_len:
             out.append("- ...")
             break
+
         out.append(bullet)
         current_len += needed
 
@@ -582,6 +596,37 @@ def build_skill_block(skill_name, skill_data):
     return "\n".join(lines).strip()
 
 
+def split_long_block(block, max_len=950):
+    if len(block) <= max_len:
+        return [block]
+
+    lines = block.split("\n")
+    if not lines:
+        return []
+
+    header = lines[0]
+    body_lines = lines[1:]
+
+    chunks = []
+    current = [header]
+    current_len = len(header)
+
+    for line in body_lines:
+        extra = len(line) + 1
+        if current and current_len + extra > max_len:
+            chunks.append("\n".join(current).strip())
+            current = [f"{header} (계속)"]
+            current_len = len(current[0])
+
+        current.append(line)
+        current_len += extra
+
+    if current:
+        chunks.append("\n".join(current).strip())
+
+    return chunks
+
+
 def chunk_text_blocks(blocks, max_len=950):
     if not blocks:
         return []
@@ -606,6 +651,36 @@ def chunk_text_blocks(blocks, max_len=950):
     return chunks
 
 
+def chunk_bullet_lines(lines, max_len=950):
+    cleaned = [normalize_line(x) for x in lines if normalize_line(x)]
+    if not cleaned:
+        return []
+
+    formatted = [
+        wrap_text(x, initial_indent="- ", subsequent_indent="  ", width=44)
+        for x in cleaned
+    ]
+
+    chunks = []
+    current = []
+    current_len = 0
+
+    for item in formatted:
+        add_len = len(item) + (1 if current else 0)
+        if current and current_len + add_len > max_len:
+            chunks.append("\n".join(current))
+            current = [item]
+            current_len = len(item)
+        else:
+            current.append(item)
+            current_len += add_len
+
+    if current:
+        chunks.append("\n".join(current))
+
+    return chunks
+
+
 def build_balance_fields(balance_groups):
     fields = []
 
@@ -614,8 +689,11 @@ def build_balance_fields(balance_groups):
 
         for skill_name, skill_data in skills.items():
             block = build_skill_block(skill_name, skill_data)
-            if block:
-                skill_blocks.append(block)
+            if not block:
+                continue
+
+            for piece in split_long_block(block, max_len=950):
+                skill_blocks.append(piece)
 
         if not skill_blocks:
             continue
@@ -627,11 +705,33 @@ def build_balance_fields(balance_groups):
             field_name = character if total == 1 else f"{character} ({idx}/{total})"
             fields.append(
                 {
-                    "name": field_name,
+                    "name": field_name[:256],
                     "value": chunk[:MAX_FIELD_VALUE],
                     "inline": False,
                 }
             )
+
+    return fields
+
+
+def build_balance_fallback_fields(lines):
+    cleaned = cleanup_balance_detail_lines(lines)
+    if not cleaned:
+        return []
+
+    chunks = chunk_bullet_lines(cleaned, max_len=950)
+    fields = []
+
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        name = "밸런스 원문" if total == 1 else f"밸런스 원문 ({idx}/{total})"
+        fields.append(
+            {
+                "name": name,
+                "value": chunk[:MAX_FIELD_VALUE],
+                "inline": False,
+            }
+        )
 
     return fields
 
@@ -646,7 +746,8 @@ def parse_post(url):
 
     system_summary = build_summary_text(sections["system"], max_len=900)
     etc_summary = build_summary_text(sections["etc"], max_len=900)
-    balance_groups = parse_balance_groups(sections["balance"])
+
+    balance_groups, balance_comments = parse_balance_groups(sections["balance"])
 
     return {
         "title": title,
@@ -654,6 +755,8 @@ def parse_post(url):
         "system_summary": system_summary,
         "etc_summary": etc_summary,
         "balance_groups": balance_groups,
+        "balance_comments": balance_comments,
+        "balance_raw_lines": sections["balance"],
     }
 
 
@@ -672,7 +775,7 @@ def build_payloads(post):
         )
 
     intro_embed = {
-        "title": post["title"],
+        "title": post["title"][:256],
         "url": post["url"],
         "description": "원문은 제목을 눌러 확인할 수 있습니다.",
         "color": 0x5865F2,
@@ -680,8 +783,31 @@ def build_payloads(post):
     }
     payloads.append({"embeds": [intro_embed]})
 
-    # 2) 밸런스 상세 메시지들
+    # 2) 밸런스 공통 개발자 코멘트
+    if post["balance_comments"]:
+        comment_chunks = chunk_bullet_lines(post["balance_comments"], max_len=950)
+        for chunk in comment_chunks:
+            embed = {
+                "title": "밸런스 개발자 코멘트",
+                "url": post["url"],
+                "color": 0xF1C40F,
+                "fields": [
+                    {
+                        "name": "개발자 코멘트",
+                        "value": chunk[:MAX_FIELD_VALUE],
+                        "inline": False,
+                    }
+                ],
+            }
+            payloads.append({"embeds": [embed]})
+
+    # 3) 밸런스 상세
     balance_fields = build_balance_fields(post["balance_groups"])
+
+    # fallback: 그룹 파싱이 실패했으면 원문 줄이라도 보내기
+    if not balance_fields:
+        balance_fields = build_balance_fallback_fields(post["balance_raw_lines"])
+
     if balance_fields:
         for i in range(0, len(balance_fields), MAX_FIELDS_PER_EMBED):
             chunk = balance_fields[i:i + MAX_FIELDS_PER_EMBED]
@@ -693,7 +819,7 @@ def build_payloads(post):
             }
             payloads.append({"embeds": [embed]})
 
-    # 3) 기타 메시지
+    # 4) 기타
     if post["etc_summary"] and post["etc_summary"] != "내용 없음":
         etc_embed = {
             "title": "버그 수정 / 기타",
@@ -713,24 +839,30 @@ def build_payloads(post):
 
 
 def send_payload(payload):
-    if not WEBHOOK_URL:
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook_url:
         raise RuntimeError("DISCORD_WEBHOOK_URL 환경변수가 없습니다.")
 
-    resp = requests.post(WEBHOOK_URL, json=payload, timeout=TIMEOUT)
+    resp = requests.post(webhook_url, json=payload, timeout=TIMEOUT)
+
     if resp.status_code not in (200, 204):
         raise RuntimeError(f"Discord 전송 실패: {resp.status_code} {resp.text}")
 
 
 def send_post_to_discord(post):
     payloads = build_payloads(post)
-    for payload in payloads:
+    print(f"전송할 payload 수: {len(payloads)}")
+
+    for idx, payload in enumerate(payloads, start=1):
+        print(f"payload 전송 중... ({idx}/{len(payloads)})")
         send_payload(payload)
 
 
 def main():
     state = load_state()
-    latest_url, latest_title = find_latest_target_post()
+    print("현재 state:", state)
 
+    latest_url, latest_title = find_latest_target_post()
     print("최신 URL:", latest_url)
     print("최신 제목:", latest_title)
 
@@ -743,11 +875,15 @@ def main():
     if latest_title and latest_title.strip():
         post["title"] = latest_title
 
-    print("system 요약:", post["system_summary"][:200] if post["system_summary"] else "없음")
-    print("etc 요약:", post["etc_summary"][:200] if post["etc_summary"] else "없음")
-    print("balance 캐릭터 수:", len(post["balance_groups"]))
+    print("system 요약 존재:", post["system_summary"] != "내용 없음")
+    print("etc 요약 존재:", post["etc_summary"] != "내용 없음")
+    print("balance 공통 코멘트 수:", len(post["balance_comments"]))
+    print("balance 그룹 수:", len(post["balance_groups"]))
 
     send_post_to_discord(post)
     save_state({"last_url": latest_url})
     print("전송 완료:", latest_url)
 
+
+if __name__ == "__main__":
+    main()

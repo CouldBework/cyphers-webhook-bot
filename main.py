@@ -2,6 +2,7 @@ import os
 import re
 import json
 import sys
+import textwrap
 from urllib.parse import urljoin
 
 import requests
@@ -19,48 +20,6 @@ HEADERS = {
         "Chrome/123.0.0.0 Safari/537.36"
     )
 }
-
-# ----------------------------
-# 의미 기반 규칙 테이블
-# ----------------------------
-
-STAT_HIGHER_IS_BETTER = [
-    "데미지", "공격력", "공격속도", "공격 속도",
-    "사거리", "범위", "공격범위", "공격 범위",
-    "상하 공격범위", "상하 공격 범위",
-    "추적 속도", "기본 속도", "이동속도", "이동 속도",
-    "회복량", "지속시간", "지속 시간",
-    "방어력", "체력", "치명타", "관통", "명중",
-    "발사 속도", "폭발 범위", "타격 범위",
-    "회전 각도", "최대 좌우 회전 각도"
-]
-
-STAT_LOWER_IS_BETTER = [
-    "선 딜레이", "후 딜레이", "선딜레이", "후딜레이",
-    "선딜", "후딜", "딜레이",
-    "쿨타임", "재사용 대기시간", "재사용 대기 시간",
-    "재사용시간", "재사용 시간", "대기시간", "대기 시간",
-    "시전 시간", "시전시간", "캐스팅 시간", "캐스팅시간",
-    "충전 시간", "충전시간", "준비 시간", "준비시간",
-    "경직", "소모량", "소모 SP", "소모 MP",
-    "적용 시점", "적용시간", "적용 시간"
-]
-
-FIX_KEYWORDS = [
-    "수정", "개선",
-    "오류", "문제", "툴팁", "표기", "표시", "문구",
-    "비정상", "설명", "적용 방식", "표현"
-]
-
-INCREASE_KEYWORDS = [
-    "증가됩니다", "증가", "상향", "늘어", "커집", "확장",
-    "확대", "연장", "빨라집", "상승"
-]
-
-DECREASE_KEYWORDS = [
-    "감소됩니다", "감소", "하향", "줄어", "축소",
-    "단축", "느려집", "하락"
-]
 
 
 def load_state():
@@ -102,10 +61,6 @@ def unique_keep_order(items):
             result.append(item)
 
     return result
-
-
-def contains_any(text, keywords):
-    return any(keyword in text for keyword in keywords)
 
 
 def extract_topic_urls(list_html):
@@ -520,9 +475,6 @@ def parse_balance_groups_from_lines(balance_lines):
 
 
 def extract_developer_comments(balance_lines):
-    """
-    BALANCE 섹션에서 '개발자 코멘트'를 별도로 추출
-    """
     cleaned = cleanup_balance_detail_lines(balance_lines)
 
     comments = []
@@ -571,7 +523,6 @@ def build_skill_blocks(lines):
             else:
                 current_skill["changes"].append(line)
 
-    # 변경 내용이 없는 스킬은 placeholder를 넣지 않고 제거
     filtered_skills = []
     for item in skills:
         if item["changes"]:
@@ -599,177 +550,36 @@ def enrich_balance_groups_with_skills(balance_groups):
     return enriched
 
 
-def detect_direction(text):
-    raw = normalize_space(text)
+def wrap_text_lines(text, width=44, first_prefix="", cont_prefix="  "):
+    text = normalize_space(text)
+    if not text:
+        return []
 
-    if contains_any(raw, INCREASE_KEYWORDS):
-        return "increase"
+    wrapped = textwrap.wrap(
+        text,
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False
+    )
 
-    if contains_any(raw, DECREASE_KEYWORDS):
-        return "decrease"
+    if not wrapped:
+        return [first_prefix + text]
 
-    if "→" in raw:
-        direction = compare_arrow_direction(raw)
-        if direction:
-            return direction
-
-    return None
-
-
-def detect_stat_polarity(text):
-    raw = normalize_space(text)
-
-    if contains_any(raw, STAT_LOWER_IS_BETTER):
-        return "lower_is_better"
-
-    if contains_any(raw, STAT_HIGHER_IS_BETTER):
-        return "higher_is_better"
-
-    return None
-
-
-def extract_primary_number(segment):
-    text = normalize_space(segment)
-
-    if ":" in text:
-        text = text.split(":")[-1].strip()
-
-    matches = re.findall(r"-?\d+(?:\.\d+)?", text)
-    if not matches:
-        return None
-
-    try:
-        return float(matches[0])
-    except ValueError:
-        return None
-
-
-def compare_arrow_direction(text):
-    if "→" not in text:
-        return None
-
-    left, right = text.split("→", 1)
-    before = extract_primary_number(left)
-    after = extract_primary_number(right)
-
-    if before is None or after is None:
-        return None
-
-    if after > before:
-        return "increase"
-    elif after < before:
-        return "decrease"
-    else:
-        return "same"
-
-
-def has_meaningful_stat_context(text):
-    raw = normalize_space(text)
-    return detect_stat_polarity(raw) is not None
-
-
-def classify_change_label(text, context_hint=""):
-    raw = normalize_space(text)
-    combined = normalize_space(f"{context_hint} {raw}")
-
-    stat_polarity = detect_stat_polarity(combined)
-    direction = detect_direction(raw) or detect_direction(combined)
-
-    if stat_polarity and direction in ("increase", "decrease"):
-        if stat_polarity == "higher_is_better":
-            if direction == "increase":
-                return "🔺 버프"
-            if direction == "decrease":
-                return "🔻 너프"
-
-        if stat_polarity == "lower_is_better":
-            if direction == "decrease":
-                return "🔺 버프"
-            if direction == "increase":
-                return "🔻 너프"
-
-    if contains_any(combined, FIX_KEYWORDS):
-        return "🛠 수정"
-
-    if direction == "increase":
-        return "🔺 버프"
-    if direction == "decrease":
-        return "🔻 너프"
-    if direction == "same":
-        return "🛠 수정"
-
-    return ""
-
-
-def emphasize_change_keywords(text):
-    patterns = [
-        r"(증가됩니다)",
-        r"(감소됩니다)",
-        r"(증가)",
-        r"(감소)",
-        r"(상향)",
-        r"(하향)",
-        r"(변경됩니다)",
-        r"(수정됩니다)",
-        r"(조정됩니다)",
-        r"(개선됩니다)",
-        r"(축소됩니다)",
-        r"(확대됩니다)",
-        r"(단축됩니다)",
-        r"(연장됩니다)",
-    ]
-
-    result = text
-    for pattern in patterns:
-        result = re.sub(pattern, r"**\1**", result)
-
+    result = []
+    for i, part in enumerate(wrapped):
+        prefix = first_prefix if i == 0 else cont_prefix
+        result.append(prefix + part)
     return result
 
 
-def add_label_prefix(text, label):
-    if not label:
-        return text
-
-    stripped = text.lstrip()
-    known_prefixes = ("🔺 버프", "🔻 너프", "🛠 수정")
-    if stripped.startswith(known_prefixes):
-        return text
-
-    return f"{label} {text}"
-
-
-def emphasize_arrow_line(text):
-    if "→" in text:
-        clean = text.strip()
-        if not (clean.startswith("**") and clean.endswith("**")):
-            return f"**{clean}**"
-    return text
-
-
-def format_change_line_for_discord(text, context_hint=""):
-    text = normalize_space(text)
-    label = classify_change_label(text, context_hint)
-
-    if "→" in text:
-        emphasized = emphasize_arrow_line(text)
-        return add_label_prefix(emphasized, label)
-
-    emphasized = emphasize_change_keywords(text)
-    return add_label_prefix(emphasized, label)
-
-
-def build_skill_block_text(skill_name, changes):
-    lines = [f"【{skill_name}】"]
-    current_context = ""
+def build_skill_block_lines(skill_name, changes):
+    lines = []
+    lines.extend(wrap_text_lines(skill_name, width=40, first_prefix="■ ", cont_prefix="  "))
 
     for change in changes:
-        formatted = format_change_line_for_discord(change, current_context)
-        lines.append(f"• {formatted}")
+        lines.extend(wrap_text_lines(change, width=44, first_prefix="↳ ", cont_prefix="  "))
 
-        if has_meaningful_stat_context(change):
-            current_context = change
-
-    return "\n".join(lines)
+    return lines
 
 
 def build_bullet_chunks(lines, max_len=1000):
@@ -795,55 +605,23 @@ def chunk_character_skill_blocks(group, max_len=1000):
     blocks = []
 
     if group["misc"]:
-        misc_lines = []
-        current_context = ""
-
+        misc_lines = ["■ 기타"]
         for item in group["misc"]:
-            formatted = format_change_line_for_discord(item, current_context)
-            misc_lines.append(f"• {formatted}")
-            if has_meaningful_stat_context(item):
-                current_context = item
-
-        if misc_lines:
-            misc_text = "\n".join(misc_lines)
-            blocks.append(f"【기타】\n{misc_text}")
+            misc_lines.extend(wrap_text_lines(item, width=44, first_prefix="↳ ", cont_prefix="  "))
+        blocks.append("\n".join(misc_lines))
 
     for skill in group["skills"]:
-        block = build_skill_block_text(skill["skill"], skill["changes"])
-        if block.strip():
-            blocks.append(block)
+        block_lines = build_skill_block_lines(skill["skill"], skill["changes"])
+        if block_lines:
+            blocks.append("\n".join(block_lines))
 
     if not blocks:
         return []
 
-    expanded_blocks = []
-    for block in blocks:
-        if len(block) <= max_len:
-            expanded_blocks.append(block)
-        else:
-            lines = block.splitlines()
-            header = lines[0]
-            body_lines = lines[1:] if len(lines) > 1 else []
-
-            current = header
-            partials = []
-
-            for body in body_lines:
-                if len(current) + len("\n" + body) <= max_len:
-                    current += "\n" + body
-                else:
-                    partials.append(current)
-                    current = header + "\n" + body
-
-            if current:
-                partials.append(current)
-
-            expanded_blocks.extend(partials)
-
     chunks = []
     current = ""
 
-    for block in expanded_blocks:
+    for block in blocks:
         candidate = block if not current else current + "\n\n" + block
 
         if len(candidate) <= max_len:
@@ -941,7 +719,6 @@ def build_payloads(post):
         ]
     })
 
-    # 개발자 코멘트 별도 출력
     comment_chunks = build_bullet_chunks(post["developer_comments"], max_len=1000)
     for i, chunk in enumerate(comment_chunks, start=1):
         payloads.append({
@@ -965,9 +742,8 @@ def build_payloads(post):
             ]
         })
 
-    # 밸런스 출력
     balance_fields = build_balance_fields(post["balance_groups"])
-    fields_per_message = 4
+    fields_per_message = 3
 
     for start in range(0, len(balance_fields), fields_per_message):
         group = balance_fields[start:start + fields_per_message]
@@ -981,13 +757,12 @@ def build_payloads(post):
                     "color": 15158332,
                     "fields": group,
                     "footer": {
-                        "text": "캐릭터 > 스킬별 밸런스 정리 / 의미 기반 라벨링"
+                        "text": "캐릭터 > 스킬별 밸런스 정리"
                     }
                 }
             ]
         })
 
-    # 기타
     payloads.append({
         "username": "사이퍼즈 업데이트 알리미",
         "embeds": [

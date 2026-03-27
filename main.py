@@ -239,24 +239,33 @@ def article_text_lines(soup):
 
 
 def is_section_header(line: str):
-    normalized = re.sub(r"\s+", "", line).upper()
+    normalized = normalize_line(line)
+    compact = re.sub(r"\s+", "", normalized).upper()
 
-    if normalized in {"SYSTEM", "[SYSTEM]"}:
+    # SYSTEM 계열
+    if compact.startswith("SYSTEM"):
         return "system"
-    if normalized in {"BALANCE", "[BALANCE]"}:
+    if "시스템" in normalized and (
+        normalized.startswith("SYSTEM") or normalized == "시스템"
+    ):
+        return "system"
+
+    # BALANCE 계열
+    if compact.startswith("BALANCE"):
         return "balance"
-    if normalized in {"ETC", "[ETC]"}:
+    if "밸런스" in normalized:
+        return "balance"
+    if "밸런싱" in normalized:
+        return "balance"
+
+    # ETC 계열
+    if compact.startswith("ETC"):
         return "etc"
-
-    # 한국어 헤더도 대비
-    if normalized in {"시스템"}:
-        return "system"
-    if normalized in {"밸런스"}:
-        return "balance"
-    if normalized in {"기타", "버그수정", "버그", "ETC/BUG"}:
+    if "버그 수정" in normalized or normalized == "기타":
         return "etc"
 
     return None
+
 
 
 def split_sections(lines):
@@ -267,16 +276,27 @@ def split_sections(lines):
     }
 
     mode = None
+
     for line in lines:
         header = is_section_header(line)
-        if header:
-            mode = header
+
+        if header == "system":
+            mode = "system"
+            continue
+
+        if header == "balance":
+            mode = "balance"
+            continue
+
+        if header == "etc":
+            mode = "etc"
             continue
 
         if mode in sections:
             sections[mode].append(line)
 
     return sections
+
 
 
 def cleanup_general_lines(lines):
@@ -294,15 +314,31 @@ def cleanup_general_lines(lines):
 
 def cleanup_balance_detail_lines(lines):
     result = []
+
     for raw in lines:
         line = normalize_line(raw)
+
         line = re.sub(r"^[\-•·▪▫▶▷►]+\s*", "", line)
+
+        if not line:
+            continue
+
+        # 불필요 문구 제거
         if should_skip_line(line):
             continue
+
+        # 섹션 헤더는 제외
         if is_section_header(line):
             continue
+
+        # 표 설명/빈 장식 제거
+        if line in {"※표 : 가슴 아이템 가격 변경 표", "표 : 가슴 아이템 가격 변경 표"}:
+            continue
+
         result.append(line)
+
     return dedupe_consecutive(result)
+
 
 
 def is_dev_comment_header(line: str) -> bool:
@@ -695,20 +731,23 @@ def main():
     state = load_state()
     latest_url, latest_title = find_latest_target_post()
 
+    print("최신 URL:", latest_url)
+    print("최신 제목:", latest_title)
+
     if state.get("last_url") == latest_url:
         print("새 업데이트 없음")
         return
 
     post = parse_post(latest_url)
 
-    # 목록에서 읽은 제목이 더 명확하면 보정
     if latest_title and latest_title.strip():
         post["title"] = latest_title
+
+    print("system 요약:", post["system_summary"][:200] if post["system_summary"] else "없음")
+    print("etc 요약:", post["etc_summary"][:200] if post["etc_summary"] else "없음")
+    print("balance 캐릭터 수:", len(post["balance_groups"]))
 
     send_post_to_discord(post)
     save_state({"last_url": latest_url})
     print("전송 완료:", latest_url)
 
-
-if __name__ == "__main__":
-    main()

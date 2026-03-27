@@ -1,7 +1,0 @@
-cyphers-webhook-bot/
-├─ main.py
-├─ requirements.txt
-├─ state.json          # 처음엔 비워둬도 됨
-└─ .github/
-   └─ workflows/
-      └─ cyphers.yml

@@ -31,7 +31,8 @@ STAT_HIGHER_IS_BETTER = [
     "추적 속도", "기본 속도", "이동속도", "이동 속도",
     "회복량", "지속시간", "지속 시간",
     "방어력", "체력", "치명타", "관통", "명중",
-    "발사 속도", "폭발 범위", "타격 범위"
+    "발사 속도", "폭발 범위", "타격 범위",
+    "회전 각도", "최대 좌우 회전 각도"
 ]
 
 STAT_LOWER_IS_BETTER = [
@@ -41,18 +42,25 @@ STAT_LOWER_IS_BETTER = [
     "재사용시간", "재사용 시간", "대기시간", "대기 시간",
     "시전 시간", "시전시간", "캐스팅 시간", "캐스팅시간",
     "충전 시간", "충전시간", "준비 시간", "준비시간",
-    "경직", "소모량", "소모 SP", "소모 MP"
+    "경직", "소모량", "소모 SP", "소모 MP",
+    "적용 시점", "적용시간", "적용 시간"
 ]
 
 FIX_KEYWORDS = [
-    "수정", "변경", "조정", "개선",
+    "수정", "개선",
     "오류", "문제", "툴팁", "표기", "표시", "문구",
-    "비정상", "설명", "적용 방식", "적용됩니다",
-    "가능하게", "가능하도록", "표현"
+    "비정상", "설명", "적용 방식", "표현"
 ]
 
-INCREASE_KEYWORDS = ["증가됩니다", "증가", "상향", "늘어", "커집", "확장"]
-DECREASE_KEYWORDS = ["감소됩니다", "감소", "하향", "줄어", "축소"]
+INCREASE_KEYWORDS = [
+    "증가됩니다", "증가", "상향", "늘어", "커집", "확장",
+    "확대", "연장", "빨라집", "상승"
+]
+
+DECREASE_KEYWORDS = [
+    "감소됩니다", "감소", "하향", "줄어", "축소",
+    "단축", "느려집", "하락"
+]
 
 
 def load_state():
@@ -376,7 +384,8 @@ def looks_like_character_name(line):
     bad_tokens = [
         "(", ")", ":", "→", "%", "+", "-", "/", "[", "]",
         "증가", "감소", "변경", "수정", "적용", "공격", "범위",
-        "속도", "데미지", "딜레이", "가능", "문제", "오류"
+        "속도", "데미지", "딜레이", "가능", "문제", "오류",
+        "축소", "확대", "단축", "연장"
     ]
     if any(token in line for token in bad_tokens):
         return False
@@ -393,20 +402,25 @@ def looks_like_skill_name(line):
     if line.startswith(("◎", "※")):
         return False
 
-    bad_words = [
+    change_words = [
         "데미지", "공격", "범위", "속도", "선 딜레이", "후 딜레이",
         "감소됩니다", "증가됩니다", "변경됩니다", "수정됩니다",
-        "조정됩니다", "적용됩니다", "가능하게", "문제가", "발생",
-        "추적 속도", "연속 타격", "기본 속도"
+        "조정됩니다", "개선됩니다",
+        "축소됩니다", "확대됩니다", "단축됩니다", "연장됩니다",
+        "적용됩니다", "가능하게", "문제가", "발생", "추적 속도",
+        "연속 타격", "기본 속도", "회전 각도"
     ]
-    if any(word in line for word in bad_words):
+    if any(word in line for word in change_words):
+        return False
+
+    if "→" in line or "%" in line or ":" in line:
+        return False
+
+    if line.endswith(".") or line.endswith(".)"):
         return False
 
     if re.search(r"\([^)]+\)$", line):
         return True
-
-    if ":" in line or "→" in line or "%" in line:
-        return False
 
     if re.fullmatch(r"[가-힣A-Za-z0-9\s'·\-]+", line) and len(line) <= 25:
         return True
@@ -505,6 +519,39 @@ def parse_balance_groups_from_lines(balance_lines):
     return merge_character_groups(result)
 
 
+def extract_developer_comments(balance_lines):
+    """
+    BALANCE 섹션에서 '개발자 코멘트'를 별도로 추출
+    """
+    cleaned = cleanup_balance_detail_lines(balance_lines)
+
+    comments = []
+    remaining = []
+
+    in_comment = False
+    for line in cleaned:
+        if "개발자 코멘트" in line:
+            in_comment = True
+            continue
+
+        if in_comment:
+            if looks_like_character_name(line):
+                in_comment = False
+                remaining.append(line)
+                continue
+
+            if looks_like_skill_name(line):
+                in_comment = False
+                remaining.append(line)
+                continue
+
+            comments.append(line)
+        else:
+            remaining.append(line)
+
+    return comments, remaining
+
+
 def build_skill_blocks(lines):
     cleaned = cleanup_balance_detail_lines(lines)
     skills = []
@@ -524,12 +571,14 @@ def build_skill_blocks(lines):
             else:
                 current_skill["changes"].append(line)
 
+    # 변경 내용이 없는 스킬은 placeholder를 넣지 않고 제거
+    filtered_skills = []
     for item in skills:
-        if not item["changes"]:
-            item["changes"] = ["상세 변경 내용은 원문 확인"]
+        if item["changes"]:
+            filtered_skills.append(item)
 
     return {
-        "skills": skills,
+        "skills": filtered_skills,
         "misc": misc
     }
 
@@ -626,7 +675,6 @@ def classify_change_label(text, context_hint=""):
     stat_polarity = detect_stat_polarity(combined)
     direction = detect_direction(raw) or detect_direction(combined)
 
-    # 능력치 의미 기반 판정
     if stat_polarity and direction in ("increase", "decrease"):
         if stat_polarity == "higher_is_better":
             if direction == "increase":
@@ -640,11 +688,9 @@ def classify_change_label(text, context_hint=""):
             if direction == "increase":
                 return "🔻 너프"
 
-    # 수정성 키워드
     if contains_any(combined, FIX_KEYWORDS):
         return "🛠 수정"
 
-    # 의미 해석 실패 시 일반 규칙 fallback
     if direction == "increase":
         return "🔺 버프"
     if direction == "decrease":
@@ -667,6 +713,10 @@ def emphasize_change_keywords(text):
         r"(수정됩니다)",
         r"(조정됩니다)",
         r"(개선됩니다)",
+        r"(축소됩니다)",
+        r"(확대됩니다)",
+        r"(단축됩니다)",
+        r"(연장됩니다)",
     ]
 
     result = text
@@ -722,6 +772,25 @@ def build_skill_block_text(skill_name, changes):
     return "\n".join(lines)
 
 
+def build_bullet_chunks(lines, max_len=1000):
+    chunks = []
+    current = ""
+
+    for line in lines:
+        formatted = f"• {line}\n"
+        if len(current) + len(formatted) > max_len:
+            if current.strip():
+                chunks.append(current.strip())
+            current = formatted
+        else:
+            current += formatted
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks or []
+
+
 def chunk_character_skill_blocks(group, max_len=1000):
     blocks = []
 
@@ -730,18 +799,22 @@ def chunk_character_skill_blocks(group, max_len=1000):
         current_context = ""
 
         for item in group["misc"]:
-            misc_lines.append(f"• {format_change_line_for_discord(item, current_context)}")
+            formatted = format_change_line_for_discord(item, current_context)
+            misc_lines.append(f"• {formatted}")
             if has_meaningful_stat_context(item):
                 current_context = item
 
-        misc_text = "\n".join(misc_lines)
-        blocks.append(f"【기타】\n{misc_text}")
+        if misc_lines:
+            misc_text = "\n".join(misc_lines)
+            blocks.append(f"【기타】\n{misc_text}")
 
     for skill in group["skills"]:
-        blocks.append(build_skill_block_text(skill["skill"], skill["changes"]))
+        block = build_skill_block_text(skill["skill"], skill["changes"])
+        if block.strip():
+            blocks.append(block)
 
     if not blocks:
-        return ["변경 사항 없음"]
+        return []
 
     expanded_blocks = []
     for block in blocks:
@@ -783,18 +856,14 @@ def chunk_character_skill_blocks(group, max_len=1000):
     if current:
         chunks.append(current)
 
-    return chunks or ["변경 사항 없음"]
+    return chunks
 
 
 def build_balance_fields(balance_groups):
     fields = []
 
     if not balance_groups:
-        return [{
-            "name": "밸런스",
-            "value": "변경 사항 없음",
-            "inline": False
-        }]
+        return []
 
     for group in balance_groups:
         character = group["character"]
@@ -826,9 +895,11 @@ def parse_post(post):
     system_text = build_summary_text(sections["system"], limit=4)
     etc_text = build_summary_text(sections["etc"], limit=4)
 
+    developer_comments, balance_lines_without_comments = extract_developer_comments(sections["balance"])
+
     balance_groups = parse_balance_groups_from_tables(soup)
     if not balance_groups:
-        balance_groups = parse_balance_groups_from_lines(sections["balance"])
+        balance_groups = parse_balance_groups_from_lines(balance_lines_without_comments)
 
     balance_groups = enrich_balance_groups_with_skills(balance_groups)
 
@@ -836,6 +907,7 @@ def parse_post(post):
         "title": title,
         "url": url,
         "system": system_text[:1024],
+        "developer_comments": developer_comments,
         "balance_groups": balance_groups,
         "etc": etc_text[:1024],
     }
@@ -843,6 +915,14 @@ def parse_post(post):
 
 def build_payloads(post):
     payloads = []
+
+    main_fields = [
+        {
+            "name": "시스템",
+            "value": post["system"] or "변경 사항 없음",
+            "inline": False
+        }
+    ]
 
     payloads.append({
         "username": "사이퍼즈 업데이트 알리미",
@@ -853,23 +933,42 @@ def build_payloads(post):
                 "url": post["url"],
                 "description": "사이퍼즈 공식 업데이트 새 글을 감지해 자동으로 정리했습니다.",
                 "color": 15158332,
-                "fields": [
-                    {
-                        "name": "시스템",
-                        "value": post["system"] or "변경 사항 없음",
-                        "inline": False
-                    }
-                ],
+                "fields": main_fields,
                 "footer": {
-                    "text": "밸런스는 캐릭터 > 스킬 단위로 아래 메시지에 이어서 전송됩니다."
+                    "text": "개발자 코멘트와 밸런스는 아래 메시지에 이어서 전송됩니다."
                 }
             }
         ]
     })
 
-    balance_fields = build_balance_fields(post["balance_groups"])
+    # 개발자 코멘트 별도 출력
+    comment_chunks = build_bullet_chunks(post["developer_comments"], max_len=1000)
+    for i, chunk in enumerate(comment_chunks, start=1):
+        payloads.append({
+            "username": "사이퍼즈 업데이트 알리미",
+            "embeds": [
+                {
+                    "title": f"{post['title'][:220]} - 개발자 코멘트",
+                    "url": post["url"],
+                    "color": 3447003,
+                    "fields": [
+                        {
+                            "name": "개발자 코멘트" if len(comment_chunks) == 1 else f"개발자 코멘트 ({i}/{len(comment_chunks)})",
+                            "value": chunk[:1024],
+                            "inline": False
+                        }
+                    ],
+                    "footer": {
+                        "text": "개발자 코멘트 분리 표시"
+                    }
+                }
+            ]
+        })
 
+    # 밸런스 출력
+    balance_fields = build_balance_fields(post["balance_groups"])
     fields_per_message = 4
+
     for start in range(0, len(balance_fields), fields_per_message):
         group = balance_fields[start:start + fields_per_message]
 
@@ -888,6 +987,7 @@ def build_payloads(post):
             ]
         })
 
+    # 기타
     payloads.append({
         "username": "사이퍼즈 업데이트 알리미",
         "embeds": [

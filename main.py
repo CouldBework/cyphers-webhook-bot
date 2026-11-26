@@ -1,17 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-사이퍼즈 정기점검 업데이트 → Discord Webhook 봇 (최종본)
+사이퍼즈 정기점검 업데이트 → Discord Webhook 봇 (표 기반 최종본 v2)
 
-- 공식 업데이트 페이지의 <table> 구조를 그대로 파싱 (rowspan/colspan 처리)
-- 캐릭터 밸런싱: 표의 1열(th)=캐릭터명, 2열(td)=스킬/변경내용 → 정확한 묶음
-- 시스템 / 밸런스 개발자 코멘트 / 밸런스 상세 / 버그 수정·기타 로 메시지 분리
-- Discord embed 제한(필드 1024자, 필드 25개)에 맞게 자동 분할 전송
+- 공식 업데이트 페이지의 모든 <table>(역할군 고정 버프/전투 아이템/캐릭터 밸런싱)을
+  행(1열=이름, 2열=내용) 단위로 그대로 파싱 → 내용 누락 방지
+- 줄머리 불릿 기호("- ")만 제거하고 "-10%" 같은 음수 값은 보존
+- 표 밖의 문단형 '개발자 코멘트'도 별도 임베드로 전송
+- rowspan/colspan 확장 처리, Discord embed 제한(필드 1024자)에 맞춰 자동 분할
 - state.json 으로 마지막 전송 글 저장 → 중복 전송 방지
-
-사용법:
-  1) GitHub 저장소 Secret에 DISCORD_WEBHOOK_URL 등록
-  2) .github/workflows/cyphers.yml 의 schedule(예: 15분) 또는 workflow_dispatch 로 실행
-  3) 강제 재전송: state.json 을 {"last_url": null} 로 바꾸고 실행
 """
 
 import os
@@ -38,7 +34,24 @@ HEADERS = {
 TIMEOUT = 20
 MAX_FIELD_VALUE = 1024
 MAX_FIELDS_PER_EMBED = 4
-MAX_FIELDS_PER_EMBED_DISCORD = 25
+
+# '스킬명(조작키)' 패턴: 박쥐(L), 사영도(2nd R), 라이트닝 스텝(SP) 등
+SKILL_KEY_PATTERN = re.compile(
+    r"\((?:[^)]*(?:L|R|E|F|SP|SL|LR|2nd|Shift|Tab|Wheel)[^)]*)\)", re.I
+)
+
+# 가격표(아이템 가격 조정 표) 판별용 헤더 키워드 → 이 표는 스킵
+PRICE_TABLE_HEADERS = {
+    "상의", "하의", "장갑", "신발", "손", "가슴", "허리", "발",
+    "1단계", "2단계", "3단계", "유니크/OM/공용", "레전더리",
+}
+
+# '변경 내용'으로 판단할 힌트 키워드 (스킬명 헤더 오분리 방지에 사용)
+CHANGE_HINTS = (
+    "쿨타임", "대미지", "증가", "감소", "조정", "적용", "체력", "공격력",
+    "방어", "흡혈", "보호막", "속도", "범위", "코인", "시야", "지속시간",
+    "딜레이", "관통", "경직", "무적", "넉백", "타격",
+)
 
 
 # ---------- 텍스트 정규화 ----------
@@ -47,6 +60,19 @@ def normalize_line(text: str) -> str:
     """nbsp / 전각 공백 / zero-width 문자를 일반 공백으로 통일"""
     text = re.sub(r"[\u00a0\u2000-\u200b\u3000\ufeff]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_cell_line(text: str) -> str:
+    """
+    표 셀 내부 한 줄 정규화.
+    줄머리 불릿 기호('- ', '•' 등)는 제거하되, '-10%' 같은 음수 값은 보존:
+      - 불릿 제거 조건 = 대시 뒤에 공백이 오는 경우만 ('- 쿨타임이...' → '쿨타임이...')
+      - '-10%→-15%' 는 대시 뒤에 숫자가 바로 오므로 그대로 유지
+    """
+    text = re.sub(r"[\u00a0\u2000-\u200b\u3000\ufeff]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(?:[-•·▪▫▶▷►]\s+|[•·▪▫▶▷►※]\s*)+", "", text)
+    return text
 
 
 def dedupe_consecutive(lines):
@@ -70,6 +96,17 @@ def unique_keep_order(items):
 def clip(text: str, max_len: int) -> str:
     """강제 줄바꿈 없이 길이만 제한 (줄바꿈은 Discord가 화면폭에 맞게 처리)"""
     return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def looks_like_change_content(line: str) -> bool:
+    """그 줄이 '변경 내용'(스킬명이 아닌 실제 내용)인지 판단"""
+    if not line:
+        return False
+    if "→" in line:
+        return True
+    if any(k in line for k in CHANGE_HINTS):
+        return True
+    return bool(re.search(r"\d", line) and any(t in line for t in (":", "%", "초")))
 
 
 # ---------- 상태 저장 ----------
@@ -139,10 +176,6 @@ def extract_topic_urls(html_text):
     return result
 
 
-def clean_title(text):
-    return normalize_line(text)
-
-
 def extract_title_from_soup(soup):
     for sel in [
         "h1", ".title", ".subject", ".tit",
@@ -150,12 +183,12 @@ def extract_title_from_soup(soup):
     ]:
         el = soup.select_one(sel)
         if el:
-            title = clean_title(el.get_text(" ", strip=True))
+            title = normalize_line(el.get_text(" ", strip=True))
             if title:
                 return title
 
     if soup.title:
-        title = clean_title(soup.title.get_text(" ", strip=True))
+        title = normalize_line(soup.title.get_text(" ", strip=True))
         if title:
             return title
 
@@ -189,7 +222,6 @@ def find_latest_target_post():
         except Exception as e:
             print(f"[warn] 글 확인 실패: {url} / {e}")
 
-    # 필터에 걸리는 제목이 없으면 최신 글이라도 반환
     fallback_url = urls[0]
     try:
         soup = BeautifulSoup(fetch_html(fallback_url), "html.parser")
@@ -219,7 +251,7 @@ def article_text_lines(soup):
     return dedupe_consecutive(raw_lines)
 
 
-# ---------- 섹션 분리 ----------
+# ---------- 섹션 분리 (표 밖 텍스트 기준) ----------
 
 def is_section_header(line: str):
     normalized = normalize_line(line)
@@ -261,8 +293,7 @@ def split_sections(lines):
 def clean_lines(lines):
     result = []
     for raw in lines:
-        line = normalize_line(raw)
-        line = re.sub(r"^[\-•·▪▫▶▷►◎※*]+\s*", "", line)
+        line = normalize_cell_line(raw)
         if not line:
             continue
         if should_skip_line(line):
@@ -273,28 +304,72 @@ def clean_lines(lines):
     return result
 
 
+def is_dev_comment_line(line: str) -> bool:
+    normalized = normalize_line(line).strip("[]").lstrip("◎*•- ")
+    return normalized.startswith("개발자 코멘트")
+
+
+def extract_standalone_dev_comments(lines):
+    """
+    표 밖에 문단으로 쓰인 '◎ 개발자 코멘트' 블록을 추출.
+    마커 뒤에 이어지는 긴 문단 줄들을 코멘트로 묶는다.
+    """
+    comments = []
+    current = None
+
+    for raw in lines:
+        line = normalize_cell_line(raw)
+        if not line or should_skip_line(line):
+            continue
+
+        if is_dev_comment_line(line):
+            if current:
+                comments.append(" ".join(current))
+            current = []
+            # '개발자 코멘트: 내용...' 한 줄 형태면 내용만 분리
+            inline = re.sub(r"^.*?개발자\s*코멘트\]?[:：]?\s*", "", line)
+            if inline and inline != line:
+                current.append(inline)
+            continue
+
+        if current is None:
+            continue
+
+        # 코멘트 문단은 보통 긴 문장. 짧은 제목성 줄이 나오면 문단 끝으로 판단.
+        if len(line) < 25 or line.startswith("*") or looks_like_change_content(line) and len(line) < 40:
+            comments.append(" ".join(current))
+            current = None
+            continue
+
+        current.append(line)
+
+    if current:
+        comments.append(" ".join(current))
+
+    return unique_keep_order(comments)
+
+
 # ---------- 표 구조 파싱 (rowspan / colspan 처리) ----------
 
 def expand_table_rows(table):
     """
     <table>을 rowspan/colspan 확장한 2차원 그리드로 변환.
-    각 셀은 (tag_name, text) 형태. 텍스트는 줄바꿈(\n) 보존.
+    각 셀은 (tag_name, text) 형태. 텍스트는 줄바꿈(\\n) 보존.
     """
     grid = {}
-    tracked = []  # (row_idx, col_idx, remaining, cell_tag, text)
+    tracked = []  # (row_idx, col_idx, rowspan_remaining, tag, text)
 
     for r, tr in enumerate(table.select("tr")):
         col = 0
-        # 이전 행에서 rowspan 이어지는 채우기
+        occupied = set()
+        # 이전 행에서 rowspan 으로 이어지는 셀 채우기
         for (ri, ci, remaining, tag, text) in tracked:
-            if ri + remaining > r and ci >= col:
+            if remaining > 0 and ci not in occupied:
                 grid[(r, ci)] = (tag, text)
-                col = ci + 1
+                occupied.add(ci)
 
         for cell in tr.select("th, td"):
-            while any(c == col for (_, c, _, _, _) in tracked if _ + _ > -1) and (
-                any(ri <= r < ri + remaining and ci == col for (ri, ci, remaining, _, _) in tracked)
-            ):
+            while col in occupied:
                 col += 1
 
             tag = cell.name
@@ -311,6 +386,14 @@ def expand_table_rows(table):
 
             col += colspan
 
+        # rowspan 잔여 횟수 갱신
+        new_tracked = []
+        for (ri, ci, remaining, tag, text) in tracked:
+            if ri == r:
+                continue
+            new_tracked.append((ri, ci, remaining - 1, tag, text))
+        tracked = new_tracked
+
     if not grid:
         return []
 
@@ -319,87 +402,68 @@ def expand_table_rows(table):
 
     rows = []
     for r in range(max_row + 1):
-        row = []
-        for c in range(max_col + 1):
-            row.append(grid.get((r, c), (None, "")))
-        rows.append(row)
+        rows.append([grid.get((r, c), (None, "")) for c in range(max_col + 1)])
 
     return rows
 
 
-SKILL_KEY_PATTERN = re.compile(
-    r"\((?:[^)]*(?:L|R|E|F|SP|SL|LR|2nd|Shift|Tab|Wheel)[^)]*)\)", re.I
-)
-
-PRICE_TABLE_HEADERS = {
-    "상의", "하의", "장갑", "신발", "손", "가슴", "허리", "발",
-    "1단계", "2단계", "3단계", "유니크/OM/공용", "레전더리",
-}
-
-
-def is_dev_comment_line(line: str) -> bool:
-    normalized = normalize_line(line).strip("[]").lstrip("◎*•- ")
-    return normalized.startswith("개발자 코멘트")
-
-
 def split_cell_into_entries(cell_text: str):
     """
-    캐릭터 밸런싱 셀(text)을 [(스킬명, [내용...]), ...] 로 구조화.
-    셀 안의 '개발자 코멘트' 줄은 ('개발자 코멘트', [...]) 로 따로 모음.
+    셀 텍스트를 [(이름, [줄...]), ...] 로 구조화.
+
+    - '스킬명(조작키)' 줄은 스킬 헤더로 인식 (단, 뒤에 변경 내용이 붙어 있으면 내용 줄로 취급)
+      예: '궁극기(E) 쿨타임 -10%→-15%, SL스킬 쿨타임 -5%' → 스킬 분리 없이 내용 한 줄로 보존
+    - '개발자 코멘트' 줄은 별도 엔트리로 분리
+    - '기본 스탯' / '캐릭터 스탯' 줄도 스킬 헤더로 취급
     """
-    entries = []  # [ [이름, [줄...]] ]
+    entries = []
     current = None
-    mode = "changes"
 
-    raw_lines = cell_text.split("\n")
-    for raw in raw_lines:
-        line = normalize_cell_line(raw)
-        if not line:
-            continue
+    lines = [l for l in (normalize_cell_line(x) for x in cell_text.split("\n")) if l]
 
+    for line in lines:
         if is_dev_comment_line(line):
             current = ["개발자 코멘트", []]
             entries.append(current)
-            mode = "comments"
             continue
 
-        # 스킬명 패턴 (예: 박쥐(L), 사영도(2nd R))
+        if line in ("기본 스탯", "캐릭터 스탯"):
+            current = [line, []]
+            entries.append(current)
+            continue
+
+        # 스킬명(조작키) 헤더 검사: 이름+키 뒤에 내용이 없어야 헤더로 인정
         m = re.match(
-            r"^([가-힣A-Za-z0-9\s·ㆍ'/-]{1,30}?" + SKILL_KEY_PATTERN.pattern + r")\s*(.*)$",
+            r"^([가-힣A-Za-z0-9\s·ㆍ'/-]{1,30}" + SKILL_KEY_PATTERN.pattern + r")\s*(.*)$",
             line,
         )
-        if m and not line.startswith("-"):
-            skill_name = normalize_line(m.group(1))
+        if m:
             rest = normalize_line(m.group(2))
-            current = [skill_name, []]
-            entries.append(current)
-            mode = "changes"
-            if rest:
-                current[1].append(rest)
-            continue
+            if not rest or not looks_like_change_content(rest):
+                current = [normalize_line(m.group(1)), []]
+                entries.append(current)
+                if rest:
+                    current[1].append(rest)
+                continue
+            # 뒤에 변경 내용이 붙어 있으면 → 그냥 내용 줄 (ex. 궁극기(E) 쿨타임 -10%→-15%)
 
         if current is None:
-            # 스킬명 없이 바로 내용이 나오는 경우
-            current = ["기타", []]
+            current = ["변경 내용", []]
             entries.append(current)
 
         current[1].append(line)
 
-    return [(name, lines) for name, lines in entries if lines or name != "기타"]
+    return [(name, ls) for name, ls in entries if ls or name not in ("변경 내용",)]
 
 
-def normalize_cell_line(text: str) -> str:
-    text = re.sub(r"[\u00a0\u2000-\u200b\u3000\ufeff]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"^[\-•·▪▫▶▷►※]+\s*", "", text)
-    return text
-
-
-def extract_character_balance_from_tables(soup):
+def extract_table_sections(soup):
     """
-    페이지의 <table> 중 '캐릭터 밸런싱' 표(1열=th 캐릭터명, 2열=스킬 상세)를 찾아
-    OrderedDict {캐릭터명: [(스킬명, [내용...]), ...]} 로 반환.
-    rowspan 덕분에 캐릭터당 여러 행이어도 하나로 묶임.
+    페이지의 모든 <table>에서 밸런스 데이터를 행 단위로 수집.
+    1열=이름(역할군/오브젝트/캐릭터), 2열=내용. 가격표는 제외.
+
+    반환: OrderedDict {이름: [(이름, [줄...]), ...]}
+    이전 버전의 '스킬 패턴이 있는 행만 통과' 조건을 없애서
+    스트라이커/컨트롤러 역할군 버프처럼 스킬 패턴이 없는 행도 누락되지 않음.
     """
     result = OrderedDict()
 
@@ -408,43 +472,33 @@ def extract_character_balance_from_tables(soup):
         if not rows:
             continue
 
-        # 표 모양 확인: 첫 행의 1번째 셀이 th 여야 함
-        first_row = rows[0]
-        first_tag = first_row[0][0] if first_row else None
-        if first_tag != "th":
-            continue
-
         # 가격표(상의/1단계...)는 제외
-        first_texts = {normalize_line(cell[1]) for cell in first_row if cell[1]}
+        first_texts = {normalize_line(c[1]) for c in rows[0] if c[1]}
         if first_texts & PRICE_TABLE_HEADERS:
             continue
 
-        char_count = 0
         for row in rows:
             if len(row) < 2:
                 continue
 
-            char_tag, char_text = row[0]
-            _, detail_text = row[1]
+            name = normalize_line(row[0][1])
+            detail = row[1][1]
 
-            char_name = normalize_line(char_text)
-            if not char_name or not detail_text:
+            if not name or not detail:
                 continue
 
-            # 캐릭터 밸런싱 표인지 확인: 스킬 패턴이 등장해야 함
-            if not SKILL_KEY_PATTERN.search(detail_text):
-                continue
-
-            entries = split_cell_into_entries(detail_text)
+            entries = split_cell_into_entries(detail)
             if not entries:
                 continue
 
-            if char_name not in result:
-                result[char_name] = []
-            result[char_name].extend(entries)
-            char_count += 1
-
-        # 캐릭터 밸런싱 표를 찾았으면 이 표는 처리 완료
+            if name in result:
+                # rowspan 으로 이어진 행: 중복 엔트리 방지하며 병합
+                existing = result[name]
+                for entry in entries:
+                    if entry not in existing:
+                        existing.append(entry)
+            else:
+                result[name] = list(entries)
 
     return result
 
@@ -471,21 +525,18 @@ def build_summary_text(lines, max_len=900):
 
 # ---------- 밸런스 필드 생성 ----------
 
-def build_skill_block(skill_name, change_lines, comment_lines):
-    if not change_lines and not comment_lines:
+def build_skill_block(skill_name, lines):
+    """스킬(또는 항목) 하나의 블록 텍스트"""
+    if not lines:
         return ""
 
-    lines = [f"■ {skill_name}"]
+    if skill_name in ("변경 내용",):
+        # 역할군 버프처럼 스킬 구분이 없는 경우: 굵은 헤더 없이 불릿만
+        return "\n".join(f"　{l}" for l in lines).strip()
 
-    if change_lines:
-        lines += [f"　{c}" for c in change_lines]
-
-    if comment_lines:
-        lines.append("")
-        lines.append("　개발자 코멘트")
-        lines += [f"　{c}" for c in comment_lines]
-
-    return "\n".join(lines).strip()
+    out = [f"■ {skill_name}"]
+    out += [f"　{l}" for l in lines]
+    return "\n".join(out).strip()
 
 
 def chunk_text_blocks(blocks, max_len=950):
@@ -512,23 +563,24 @@ def chunk_text_blocks(blocks, max_len=950):
     return chunks
 
 
-def build_balance_fields_from_tables(balance_tables):
-    """표 기반: 캐릭터별 필드 생성 (길면 자동 분할)"""
+def build_balance_fields_from_tables(table_sections):
+    """표 기반: 행(역할군/오브젝트/캐릭터)별 필드 생성. 길면 자동 분할."""
     fields = []
 
-    for character, entries in balance_tables.items():
-        change_blocks = []
-        comment_blocks = []
+    for name, entries in table_sections.items():
+        blocks = []
+        comments = []
 
-        for skill_name, lines in entries:
-            if skill_name == "개발자 코멘트":
-                comment_blocks.append("\n".join(f"　{x}" for x in lines))
-            else:
-                block = build_skill_block(skill_name, lines, [])
-                if block:
-                    change_blocks.append(block)
+        for entry_name, lines in entries:
+            if entry_name == "개발자 코멘트":
+                comments.append("\n".join(f"　{x}" for x in lines))
+                continue
+            block = build_skill_block(entry_name, lines)
+            if block:
+                blocks.append(block)
 
-        blocks = change_blocks + (["**개발자 코멘트**\n" + c for c in comment_blocks])
+        for comment in comments:
+            blocks.append("■ 개발자 코멘트\n" + comment)
 
         if not blocks:
             continue
@@ -537,9 +589,9 @@ def build_balance_fields_from_tables(balance_tables):
         total = len(chunks)
 
         for idx, chunk in enumerate(chunks, start=1):
-            name = character if total == 1 else f"{character} ({idx}/{total})"
+            field_name = name if total == 1 else f"{name} ({idx}/{total})"
             fields.append({
-                "name": clip(name, 256),
+                "name": clip(field_name, 256),
                 "value": clip(chunk, MAX_FIELD_VALUE),
                 "inline": False,
             })
@@ -548,7 +600,7 @@ def build_balance_fields_from_tables(balance_tables):
 
 
 def build_balance_fallback_fields(lines):
-    """표가 없는 옛 글용 fallback: 텍스트 줄을 그대로 묶어서 전송"""
+    """표가 아예 없는 옛 글용 fallback: 텍스트 줄을 묶어서 전송"""
     cleaned = clean_lines(lines)
     if not cleaned:
         return []
@@ -593,14 +645,16 @@ def parse_post(url):
     system_summary = build_summary_text(sections["system"], max_len=900)
     etc_summary = build_summary_text(sections["etc"], max_len=900)
 
-    balance_tables = extract_character_balance_from_tables(soup)
+    table_sections = extract_table_sections(soup)
+    balance_dev_comments = extract_standalone_dev_comments(sections["balance"])
 
     return {
         "title": title,
         "url": url,
         "system_summary": system_summary,
         "etc_summary": etc_summary,
-        "balance_tables": balance_tables,
+        "table_sections": table_sections,
+        "balance_dev_comments": balance_dev_comments,
         "balance_raw_lines": sections["balance"],
     }
 
@@ -629,8 +683,24 @@ def build_payloads(post):
         }]
     })
 
-    # 2) 밸런스 상세 (표 기반 → 실패 시 fallback)
-    balance_fields = build_balance_fields_from_tables(post["balance_tables"])
+    # 2) 표 밖 문단형 '밸런스 개발자 코멘트' (역할군 조정 방향 등)
+    if post["balance_dev_comments"]:
+        for chunk in chunk_text_blocks(post["balance_dev_comments"], max_len=950):
+            payloads.append({
+                "embeds": [{
+                    "title": "밸런스 개발자 코멘트",
+                    "url": post["url"],
+                    "color": 0xF1C40F,
+                    "fields": [{
+                        "name": "코멘트",
+                        "value": clip(chunk, MAX_FIELD_VALUE),
+                        "inline": False,
+                    }],
+                }]
+            })
+
+    # 3) 밸런스 상세 (표 전체 → 실패 시 fallback)
+    balance_fields = build_balance_fields_from_tables(post["table_sections"])
     if not balance_fields:
         balance_fields = build_balance_fallback_fields(post["balance_raw_lines"])
 
@@ -644,7 +714,7 @@ def build_payloads(post):
             }]
         })
 
-    # 3) 버그 수정 / 기타
+    # 4) 버그 수정 / 기타
     if post["etc_summary"] != "내용 없음":
         payloads.append({
             "embeds": [{
@@ -697,7 +767,8 @@ def main():
         post["title"] = latest_title
 
     print("system 요약 존재:", post["system_summary"] != "내용 없음")
-    print("balance 캐릭터 수:", len(post["balance_tables"]))
+    print("표 섹션 수:", len(post["table_sections"]))
+    print("표 밖 개발자 코멘트 수:", len(post["balance_dev_comments"]))
 
     send_post_to_discord(post)
     save_state({"last_url": latest_url})

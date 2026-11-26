@@ -1,0 +1,71 @@
+# 사이퍼즈 공지 스크래퍼 자동 실행 워크플로우
+#
+# 동작: 주기마다 cyphers_notice_scraper.py 실행 →
+#       notice_<MMDD>.md / notice_<MMDD>_table_N.csv 를 생성 →
+#       새 파일이면 저장소에 커밋해서 기록을 남김
+#
+# 시간대 주의: cron 은 UTC 기준입니다.
+#   KST(UTC+9) 기준 오전 9시 = UTC 0시 = "0 0 * * *"
+#   아래 예시는 매 1시간마다 실행 (UTC) → KST 기준 오전 9시, 10시, 11시... 에 해당하는 지점에서 돌게 됨
+#   KST 기준 특정 시각에 맞추려면 9를 빼서 cron 을 작성하세요.
+
+name: cyphers-notice-scraper
+
+on:
+  schedule:
+    - cron: "0 * * * *"      # 매시간 정각 (UTC). KST 오전 10시 = "0 1 * * *"
+  workflow_dispatch:          # Actions 탭에서 수동 실행용 버튼
+
+permissions:
+  contents: write             # 생성된 파일을 저장소에 커밋하려면 필수
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper (retry up to 3 times)
+        # 넥슨 사이퍼즈 사이트가 러너 IP를 느리게 응답하거나 일시적으로 막을 수 있어서 재시도 추가.
+        # 스크립트 내부에서 이미 브라우저 User-Agent 를 보내도록 되어 있음.
+        run: |
+          for i in 1 2 3; do
+            echo "시도 $i / 3"
+            python3 cyphers_notice_scraper.py && break
+            echo "실패, 30초 후 재시도..."
+            sleep 30
+          done
+        shell: bash
+
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add notice_*.md notice_*.csv 2>/dev/null || true
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "docs: 사이퍼즈 공지 스크랩 자동 갱신 $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "새로 생성된 파일 없음"
+          fi
+
+      - name: Upload artifact
+        # 커밋과 별개로 실행 결과를 바로 확인할 수 있게 아티팩트로도 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyphers-notice
+          path: |
+            notice_*.md
+            notice_*.csv
+          if-no-files-found: ignore

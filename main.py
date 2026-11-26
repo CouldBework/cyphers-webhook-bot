@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://cyphers.nexon.com"
 LIST_URL = f"{BASE_URL}/article/update"
+MAGAZINE_LIST_URL = f"{BASE_URL}/article/magazine"
 STATE_FILE = "state.json"
 
 HEADERS = {
@@ -112,16 +113,21 @@ def looks_like_change_content(line: str) -> bool:
 # ---------- 상태 저장 ----------
 
 def load_state():
+    """state.json 전체를 보존 (업데이트 봇용 last_url + 매거진용 magazine_last_url)"""
     if not os.path.exists(STATE_FILE):
-        return {"last_url": None}
+        return {"last_url": None, "magazine_last_url": None}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if not isinstance(data, dict):
-                return {"last_url": None}
-            return {"last_url": data.get("last_url")}
+                return {"last_url": None, "magazine_last_url": None}
+            state = {
+                "last_url": data.get("last_url"),
+                "magazine_last_url": data.get("magazine_last_url"),
+            }
+            return state
     except Exception:
-        return {"last_url": None}
+        return {"last_url": None, "magazine_last_url": None}
 
 
 def save_state(state):
@@ -633,6 +639,232 @@ def build_balance_fallback_fields(lines):
     return fields
 
 
+# ---------- 매거진 파싱 (텍스트/이미지/영상 혼합) ----------
+
+def extract_magazine_topic_urls(html_text):
+    """매거진 목록 페이지에서 /article/magazine/topic/NNNN 링크 수집 (최신순)"""
+    urls = re.findall(r"/article/magazine/topic/\d+", html_text)
+    result, seen = [], set()
+    for u in urls:
+        full = urljoin(BASE_URL, u)
+        if full not in seen:
+            seen.add(full)
+            result.append(full)
+    return result
+
+
+def build_magazine_title_map(html_text):
+    """목록 페이지에서 {절대URL: 제목} 지도를 만든다 (a 태그의 title 속성)"""
+    soup = BeautifulSoup(html_text, "html.parser")
+    title_map = {}
+    for a in soup.find_all("a", href=True):
+        if "/article/magazine/topic/" in a["href"]:
+            t = a.get("title") or normalize_line(a.get_text(" ", strip=True))
+            if t:
+                title_map[urljoin(BASE_URL, a["href"])] = t
+    return title_map
+
+
+def youtube_embed_to_watch(src: str):
+    """
+    YouTube iframe src 를 시청 URL로 변환.
+    https://www.youtube.com/embed/OMSZq_ZraiM?si=... → https://www.youtube.com/watch?v=OMSZq_ZraiM
+    """
+    m = re.search(r"(?:youtube\.com/embed/|youtu\.be/)([A-Za-z0-9_-]{6,})", src)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    # 이미 watch URL 형태면 그대로
+    if "youtube.com/watch" in src or "youtu.be/" in src:
+        return src
+    return None
+
+
+def collect_magazine_blocks(el, blocks):
+    """
+    매거진 본문을 문서 순서대로 수집.
+    blocks: [(kind, payload)] — kind: 'text' | 'image' | 'video'
+    """
+    from bs4 import NavigableString, Tag
+
+    for child in el.children:
+        if isinstance(child, NavigableString):
+            continue
+        if not isinstance(child, Tag):
+            continue
+
+        if child.name in ("script", "style", "nav", "footer"):
+            continue
+
+        # 이미지
+        if child.name == "img":
+            src = child.get("src") or child.get("data-src") or ""
+            if src:
+                blocks.append(("image", urljoin(BASE_URL, src)))
+            continue
+
+        # 영상 (YouTube iframe 등)
+        if child.name == "iframe":
+            src = child.get("src") or ""
+            video = youtube_embed_to_watch(src)
+            if video:
+                blocks.append(("video", video))
+            continue
+
+        # 표를 품은 컨테이너면 더 파고듦
+        if child.find("table") or child.find("iframe") or child.find("img"):
+            # 이 태그 자체에 직접 텍스트가 있는지도 확인
+            own_text = "".join(
+                s for s in child.find_all(string=True, recursive=False)
+            ).strip()
+            if own_text:
+                blocks.append(("text", own_text))
+            collect_magazine_blocks(child, blocks)
+            continue
+
+        # 일반 요소: 내부에 이미지/영상이 있으면 재귀, 없으면 텍스트로
+        text = child.get_text("\n", strip=True)
+        if text:
+            blocks.append(("text", text))
+
+
+def parse_magazine_post(url):
+    """매거진 글 1개를 텍스트/이미지/영상 블록으로 파싱 (문서 순서 유지)"""
+    soup = BeautifulSoup(fetch_html(url), "html.parser")
+
+    container = pick_article_container(soup)
+
+    # 제목: 목록 페이지 a 태그의 title 속성 우선 → 기존 추출기 폴백
+    title = None
+    try:
+        title_map = build_magazine_title_map(fetch_html(MAGAZINE_LIST_URL))
+        title = title_map.get(url)
+    except Exception:
+        pass
+    if not title:
+        title = extract_title_from_soup(soup)
+
+    blocks = []
+    collect_magazine_blocks(container, blocks)
+
+    # 문서 순서 유지하면서 종류별 정리 + 중복 제거
+    text_lines = []
+    images = []
+    videos = []
+
+    for kind, payload in blocks:
+        if kind == "text":
+            for line in payload.split("\n"):
+                line = normalize_cell_line(line)
+                if not line or should_skip_line(line):
+                    continue
+                if is_section_header(line):
+                    continue
+                # 조회수/댓글수 같은 숫자-only 줄과 사이트 공통 타이틀 제외
+                if re.fullmatch(r"[\d,]+", line):
+                    continue
+                if line in ("액션본능! 사이퍼즈", "CYPHERS"):
+                    continue
+                if line not in text_lines:
+                    text_lines.append(line)
+        elif kind == "image":
+            # 페이지 UI 아이콘/썸네일 공통 리소스 제외 (실제 본문 이미지만)
+            if "/thum/" in payload or "resource.cyphers.co.kr/ui/img" in payload:
+                continue
+            if payload not in images:
+                images.append(payload)
+        elif kind == "video":
+            if payload not in videos:
+                videos.append(payload)
+
+    return {
+        "title": title or "사이퍼즈 매거진",
+        "url": url,
+        "text_lines": text_lines,
+        "images": images,
+        "videos": videos,
+    }
+
+
+def build_magazine_payloads(post):
+    """
+    매거진 전송용 payload 생성.
+    - 텍스트: 첫 embed 의 description (4096자 제한, 넘으면 분할)
+    - 이미지: 1 embed 당 이미지 1개, 한 메시지 최대 10개
+    - 영상: embed 는 재생 미리보기가 안 되므로 일반 메시지 content 로 전송
+    """
+    payloads = []
+
+    # 1) 텍스트 embed (description 4096자 제한)
+    desc_text = "\n".join(f"- {l}" for l in post["text_lines"]).strip()
+    if desc_text:
+        for i in range(0, len(desc_text), 4000):
+            part = desc_text[i:i + 4000]
+            payloads.append({
+                "embeds": [{
+                    "title": clip(post["title"], 256) if i == 0 else f"{post['title']} (계속)",
+                    "url": post["url"],
+                    "description": part,
+                    "color": 0xE67E22,
+                }]
+            })
+
+    # 2) 이미지 embeds: 1 embed = 이미지 1개, 메시지당 10개
+    img_embeds = [
+        {"image": {"url": img}, "color": 0xE67E22}
+        for img in post["images"]
+    ]
+    for i in range(0, len(img_embeds), 10):
+        payloads.append({"embeds": img_embeds[i:i + 10]})
+
+    # 3) 영상: 일반 메시지 content (Discord 가 자동으로 미리보기 재생)
+    if post["videos"]:
+        content = "\n".join(post["videos"])
+        payloads.append({"content": clip(content, 2000)})
+
+    # 아무 것도 없을 때: 최소한 링크라도
+    if not payloads:
+        payloads.append({
+            "embeds": [{
+                "title": clip(post["title"], 256),
+                "url": post["url"],
+                "description": "이미지·영상·텍스트를 가져오지 못했습니다. 제목을 눌러 원문을 확인해 주세요.",
+                "color": 0xE67E22,
+            }]
+        })
+
+    return payloads
+
+
+def run_magazine_check(state):
+    """매거진 새 글 확인 → 전송 → state 갱신. state dict 를 갱신해 반환."""
+    print("--- 매거진 체크 ---")
+    html_text = fetch_html(MAGAZINE_LIST_URL)
+    urls = extract_magazine_topic_urls(html_text)
+    if not urls:
+        print("매거진 글 URL을 찾지 못했습니다.")
+        return state
+
+    latest_url = urls[0]
+    print("매거진 최신 URL:", latest_url)
+
+    if state.get("magazine_last_url") == latest_url:
+        print("매거진 새 글 없음")
+        return state
+
+    post = parse_magazine_post(latest_url)
+    print("매거진 제목:", post["title"])
+    print("텍스트 줄 수:", len(post["text_lines"]), "/ 이미지:", len(post["images"]), "/ 영상:", len(post["videos"]))
+
+    payloads = build_magazine_payloads(post)
+    print(f"매거진 전송할 payload 수: {len(payloads)}")
+    for idx, payload in enumerate(payloads, start=1):
+        print(f"매거진 payload 전송 중... ({idx}/{len(payloads)})")
+        send_payload(payload)
+
+    state["magazine_last_url"] = latest_url
+    return state
+
+
 # ---------- 게시글 파싱 ----------
 
 def parse_post(url):
@@ -754,25 +986,37 @@ def main():
     state = load_state()
     print("현재 state:", state)
 
-    latest_url, latest_title = find_latest_target_post()
-    print("최신 URL:", latest_url)
-    print("최신 제목:", latest_title)
+    # --- 1) 정기점검 업데이트 체크 ---
+    try:
+        latest_url, latest_title = find_latest_target_post()
+        print("최신 URL:", latest_url)
+        print("최신 제목:", latest_title)
 
-    if state.get("last_url") == latest_url:
-        print("새 업데이트 없음")
-        return
+        if state.get("last_url") == latest_url:
+            print("새 업데이트 없음")
+        else:
+            post = parse_post(latest_url)
+            if latest_title and latest_title.strip():
+                post["title"] = latest_title
 
-    post = parse_post(latest_url)
-    if latest_title and latest_title.strip():
-        post["title"] = latest_title
+            print("system 요약 존재:", post["system_summary"] != "내용 없음")
+            print("표 섹션 수:", len(post["table_sections"]))
+            print("표 밖 개발자 코멘트 수:", len(post["balance_dev_comments"]))
 
-    print("system 요약 존재:", post["system_summary"] != "내용 없음")
-    print("표 섹션 수:", len(post["table_sections"]))
-    print("표 밖 개발자 코멘트 수:", len(post["balance_dev_comments"]))
+            send_post_to_discord(post)
+            state["last_url"] = latest_url
+            print("전송 완료:", latest_url)
+    except Exception as e:
+        print(f"[warn] 업데이트 체크 실패: {e}")
 
-    send_post_to_discord(post)
-    save_state({"last_url": latest_url})
-    print("전송 완료:", latest_url)
+    # --- 2) 매거진 체크 (업데이트와 독립 실행, 실패해도 업데이트는 유지) ---
+    try:
+        state = run_magazine_check(state)
+    except Exception as e:
+        print(f"[warn] 매거진 체크 실패: {e}")
+
+    save_state(state)
+    print("state 저장 완료:", state)
 
 
 if __name__ == "__main__":

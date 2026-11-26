@@ -787,26 +787,23 @@ def parse_magazine_post(url):
 
 def build_magazine_payloads(post):
     """
-    매거진 전송용 payload 생성.
-    - 텍스트: 첫 embed 의 description (4096자 제한, 넘으면 분할)
+    매거진 전송용 payload 생성 (깔끔 버전).
+    - 본문 텍스트는 보내지 않음
+    - 제목+링크가 담긴 안내 embed 1개
     - 이미지: 1 embed 당 이미지 1개, 한 메시지 최대 10개
     - 영상: embed 는 재생 미리보기가 안 되므로 일반 메시지 content 로 전송
     """
     payloads = []
 
-    # 1) 텍스트 embed (description 4096자 제한)
-    desc_text = "\n".join(f"- {l}" for l in post["text_lines"]).strip()
-    if desc_text:
-        for i in range(0, len(desc_text), 4000):
-            part = desc_text[i:i + 4000]
-            payloads.append({
-                "embeds": [{
-                    "title": clip(post["title"], 256) if i == 0 else f"{post['title']} (계속)",
-                    "url": post["url"],
-                    "description": part,
-                    "color": 0xE67E22,
-                }]
-            })
+    # 1) 안내 embed: 제목 + 링크만 (본문 텍스트 없음)
+    payloads.append({
+        "embeds": [{
+            "title": clip(post["title"], 256),
+            "url": post["url"],
+            "description": "원문은 제목을 눌러 확인할 수 있습니다.",
+            "color": 0xE67E22,
+        }]
+    })
 
     # 2) 이미지 embeds: 1 embed = 이미지 1개, 메시지당 10개
     img_embeds = [

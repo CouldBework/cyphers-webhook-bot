@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# 같은 워크플로우가 동시에 여러 개 돌아서 push 충돌 나는 것 방지
+concurrency:
+  group: cyphers-update-check
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -30,14 +35,25 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main.py
 
-      - name: Commit updated state
+      - name: Commit state.json if changed
         run: |
-          if [ -n "$(git status --porcelain state.json)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add state.json
-            git commit -m "chore: update state.json"
-            git push
-          else
-            echo "No changes to state.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "state.json 변경 없음 - 커밋 생략"
+            exit 0
           fi
+          git commit -m "chore: update state.json"
+          # push가 원격 변경 때문에 거부되면 rebase 후 최대 3회 재시도
+          for i in 1 2 3; do
+            if git push; then
+              echo "push 성공"
+              exit 0
+            fi
+            echo "push 실패, 재시도 $i/3 (rebase 후 다시)"
+            git pull --rebase || git rebase --abort
+            sleep 5
+          done
+          echo "push 3회 실패"
+          exit 1

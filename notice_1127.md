@@ -3,7 +3,7 @@
 출처: https://cyphers.nexon.com/article/update/topic/28621057
 
 11월 26일 정기점검 업데이트
-9,164
+10,162
 CYPHERS
 2026-11-25 15:21:01
 
